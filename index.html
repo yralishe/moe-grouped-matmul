@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!--
+    TODO(security): Static public visualization hosted on GitHub Pages; server-only HTTP headers
+    (such as X-Frame-Options / frame-ancestors) and backend session/auth/CSRF/database controls
+    are not applicable because there is no backend server, authentication, or user data storage.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'none';">
+  <meta http-equiv="X-Content-Type-Options" content="nosniff">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>Why Mixture-of-Experts (MoE) Models Need Grouped Matmul (gmm / ragged_dot)</title>
+  <meta name="description" content="Interactive hardware visualization explaining why Mixture-of-Experts (MoE) models like Qwen 3 MoE and Gemma 4 MoE require Grouped Matrix Multiplication (gmm / ragged_dot) on TPUs instead of naive loops or zero-padding.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="hero-header">
+      <p class="eyebrow-label">TPU Hardware &amp; Kernel Architecture</p>
+      <h1>Why MoE Models Need Grouped Matmul</h1>
+      <p class="hero-lead">
+        In a dense Transformer, every token multiplies against the same feed-forward weights in one uniform operation.
+        In a <strong>Mixture-of-Experts (MoE)</strong> model, dynamic token routing creates uneven, ragged token counts per expert—breaking naive GPU/TPU execution unless fused with <code class="inline-code">grouped_matmul</code> (<code class="inline-code">gmm</code> / <code class="inline-code">ragged_dot</code>).
+      </p>
+    </header>
+
+    <main>
+      <!-- Interactive Hardware Execution Simulator -->
+      <section class="simulator-section" aria-labelledby="sim-heading">
+        <div class="simulator-top-bar">
+          <div class="mode-tabs" role="tablist" aria-label="Execution strategy selector">
+            <button type="button" id="tab-dense" class="mode-tab" role="tab" aria-selected="false" data-mode="dense">
+              1. Dense FFN
+            </button>
+            <button type="button" id="tab-loop" class="mode-tab" role="tab" aria-selected="false" data-mode="loop">
+              2. MoE Naive #1: For-Loop
+            </button>
+            <button type="button" id="tab-padded" class="mode-tab" role="tab" aria-selected="false" data-mode="padded">
+              3. MoE Naive #2: Zero-Padded
+            </button>
+            <button type="button" id="tab-gmm" class="mode-tab is-active" role="tab" aria-selected="true" data-mode="gmm">
+              4. MoE Grouped Matmul (gmm)
+            </button>
+          </div>
+
+          <div class="playback-controls">
+            <button type="button" id="btn-replay-step" class="action-btn">
+              Replay TPU Step
+            </button>
+          </div>
+        </div>
+
+        <div class="mode-summary-banner" id="mode-summary-banner">
+          <div>
+            <div class="mode-banner-title-row">
+              <h2 id="sim-heading" class="mode-banner-title">The Grouped Matmul (gmm / ragged_dot) Solution</h2>
+              <span id="mode-status-tag" class="status-tag tag-good">1 Fused Launch · 0% Padding Waste</span>
+            </div>
+            <p id="mode-banner-desc" class="mode-banner-desc">
+              Packs all routed tokens contiguously into one tensor alongside a stack of expert weights [Num_Experts, K, N] and a list of group sizes, executing all variable-sized matrix multiplications in a single fused Pallas kernel launch.
+            </p>
+          </div>
+          <div id="mode-shape-callout" class="mode-shape-callout">LHS: [835, K] (contiguous)
+RHS: [3, K, N] (stacked experts)
+group_sizes: [510, 35, 290]</div>
+        </div>
+
+        <figure class="diagram-well" aria-label="Interactive HBM tensor layout, kernel dispatch timeline, and TPU MXU tile utilization">
+          <svg id="hardware-simulator-svg" class="hardware-svg" viewBox="0 0 920 356" role="img" aria-labelledby="svg-sim-title">
+            <title id="svg-sim-title">TPU Memory Layout, Kernel Timeline, and MXU Utilization Diagram</title>
+          </svg>
+        </figure>
+
+        <div class="telemetry-strip" aria-live="polite">
+          <div class="metric-tile">
+            <span class="metric-label">Kernel Launches</span>
+            <span id="metric-launches" class="metric-value">1</span>
+            <span id="metric-launches-sub" class="metric-sub">Single fused Pallas call</span>
+          </div>
+          <div class="metric-tile">
+            <span class="metric-label">Token Rows Processed</span>
+            <span id="metric-rows" class="metric-value">835</span>
+            <span id="metric-rows-sub" class="metric-sub">835 real · 0 padded zeros</span>
+          </div>
+          <div class="metric-tile">
+            <span class="metric-label">Wasted Padding FLOPs</span>
+            <span id="metric-waste" class="metric-value">0.0%</span>
+            <span id="metric-waste-sub" class="metric-sub">Zero HBM bandwidth wasted</span>
+          </div>
+          <div class="metric-tile">
+            <span class="metric-label">Effective MXU Useful Util.</span>
+            <span id="metric-mxu" class="metric-value">92%</span>
+            <span id="metric-mxu-sub" class="metric-sub">VMEM-tiled systolic saturation</span>
+          </div>
+        </div>
+
+        <!-- Router Token Skew Controls -->
+        <div class="router-controls-panel">
+          <div class="router-controls-header">
+            <p class="router-controls-title">Dynamic MoE Router Token Counts (Adjust per-step skew):</p>
+            <div class="preset-group">
+              <button type="button" id="preset-default" class="preset-btn" data-e0="510" data-e1="35" data-e2="290">
+                Example Skew (510 / 35 / 290)
+              </button>
+              <button type="button" id="preset-hot" class="preset-btn" data-e0="720" data-e1="20" data-e2="95">
+                Hot Expert (720 / 20 / 95)
+              </button>
+              <button type="button" id="preset-balanced" class="preset-btn" data-e0="280" data-e1="275" data-e2="280">
+                Near-Uniform (280 / 275 / 280)
+              </button>
+            </div>
+          </div>
+
+          <div class="sliders-grid">
+            <div class="slider-group">
+              <label for="slider-e0" class="slider-label-row">
+                <span class="expert-swatch"><span class="swatch-dot swatch-e0"></span>Expert 0</span>
+                <span id="label-e0-count" class="slider-count">510 tokens</span>
+              </label>
+              <input type="range" id="slider-e0" class="slider-input" min="10" max="800" step="5" value="510">
+            </div>
+
+            <div class="slider-group">
+              <label for="slider-e1" class="slider-label-row">
+                <span class="expert-swatch"><span class="swatch-dot swatch-e1"></span>Expert 1</span>
+                <span id="label-e1-count" class="slider-count">35 tokens</span>
+              </label>
+              <input type="range" id="slider-e1" class="slider-input" min="5" max="800" step="5" value="35">
+            </div>
+
+            <div class="slider-group">
+              <label for="slider-e2" class="slider-label-row">
+                <span class="expert-swatch"><span class="swatch-dot swatch-e2"></span>Expert 2</span>
+                <span id="label-e2-count" class="slider-count">290 tokens</span>
+              </label>
+              <input type="range" id="slider-e2" class="slider-input" min="10" max="800" step="5" value="290">
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Architectural Foundation: Dense vs MoE -->
+      <section aria-labelledby="arch-heading">
+        <div class="section-heading-block">
+          <h2 id="arch-heading">Dense FFN vs. Mixture-of-Experts Routing</h2>
+          <p>
+            Why moving from a dense model to a sparse MoE changes the fundamental shape of matrix multiplication on TPU Matrix Multiply Units (MXUs).
+          </p>
+        </div>
+
+        <div class="architecture-split">
+          <article class="explainer-panel">
+            <div>
+              <p class="panel-kicker">Dense Architecture · e.g., Llama 3.2 1B</p>
+              <h3>Uniform Matrix Multiplication</h3>
+            </div>
+            <p>
+              Every token in a batch goes through the exact same Feed-Forward Network (FFN) weight matrix. That produces one large, rectangular matrix multiplication (<code class="inline-code">[Tokens, Hidden] &times; [Hidden, Intermediate]</code>), keeping the TPU&rsquo;s <code class="inline-code">128&times;128</code> systolic MXUs continuously saturated.
+            </p>
+            <div class="mini-diagram-frame">
+              <svg class="mini-svg" viewBox="0 0 440 132" role="img" aria-label="Dense FFN uniform matrix multiplication">
+                <rect x="14" y="20" width="96" height="92" rx="5" fill="#216e9c" opacity="0.9"/>
+                <text x="62" y="62" text-anchor="middle" fill="#ffffff" font-family="Plus Jakarta Sans, sans-serif" font-size="12" font-weight="700">All Tokens</text>
+                <text x="62" y="80" text-anchor="middle" fill="#e2eff8" font-family="JetBrains Mono, monospace" font-size="10">[835, H]</text>
+
+                <text x="132" y="71" text-anchor="middle" fill="#181c25" font-family="JetBrains Mono, monospace" font-size="18" font-weight="700">&times;</text>
+
+                <rect x="154" y="20" width="112" height="92" rx="5" fill="#181c25"/>
+                <text x="210" y="62" text-anchor="middle" fill="#ffffff" font-family="Plus Jakarta Sans, sans-serif" font-size="12" font-weight="700">Shared FFN</text>
+                <text x="210" y="80" text-anchor="middle" fill="#c9d1d9" font-family="JetBrains Mono, monospace" font-size="10">[H, Interm]</text>
+
+                <text x="290" y="71" text-anchor="middle" fill="#181c25" font-family="JetBrains Mono, monospace" font-size="16" font-weight="700">&rarr;</text>
+
+                <rect x="314" y="20" width="112" height="92" rx="5" fill="#198558"/>
+                <text x="370" y="60" text-anchor="middle" fill="#ffffff" font-family="Plus Jakarta Sans, sans-serif" font-size="12" font-weight="700">100% Dense</text>
+                <text x="370" y="78" text-anchor="middle" fill="#dcfce7" font-family="JetBrains Mono, monospace" font-size="10">MXU Saturated</text>
+              </svg>
+            </div>
+          </article>
+
+          <article class="explainer-panel">
+            <div>
+              <p class="panel-kicker">Sparse MoE · e.g., Qwen 3 MoE 30B–235B, Gemma 4 MoE</p>
+              <h3>Dynamic, Ragged Token Counts per Step</h3>
+            </div>
+            <p>
+              A learned router dynamically dispatches different numbers of tokens to different expert FFNs on every training step—for example, <strong>Expert 0 gets 510 tokens</strong>, <strong>Expert 1 gets 35 tokens</strong>, and <strong>Expert 2 gets 290 tokens</strong>. Each expert has its own distinct weight matrix <code class="inline-code">W_e</code>.
+            </p>
+            <div class="mini-diagram-frame">
+              <svg class="mini-svg" viewBox="0 0 440 132" role="img" aria-label="MoE dynamic router dispatching uneven token counts">
+                <rect x="14" y="32" width="82" height="68" rx="5" fill="#181c25"/>
+                <text x="55" y="63" text-anchor="middle" fill="#ffffff" font-family="Plus Jakarta Sans, sans-serif" font-size="12" font-weight="700">Router</text>
+                <text x="55" y="80" text-anchor="middle" fill="#c9d1d9" font-family="JetBrains Mono, monospace" font-size="10">835 tokens</text>
+
+                <path d="M98 50 L158 26 M98 66 L158 66 M98 82 L158 106" stroke="#6c7382" stroke-width="1.8" fill="none"/>
+
+                <rect x="162" y="12" width="168" height="28" rx="4" fill="#1c69ce"/>
+                <text x="172" y="30" fill="#ffffff" font-family="JetBrains Mono, monospace" font-size="11" font-weight="600">Expert 0: 510 tokens</text>
+
+                <rect x="162" y="52" width="32" height="28" rx="4" fill="#d67a10"/>
+                <text x="202" y="70" fill="#181c25" font-family="JetBrains Mono, monospace" font-size="11" font-weight="600">Expert 1: 35 tokens</text>
+
+                <rect x="162" y="92" width="104" height="28" rx="4" fill="#1b917c"/>
+                <text x="274" y="110" fill="#181c25" font-family="JetBrains Mono, monospace" font-size="11" font-weight="600">Expert 2: 290 tokens</text>
+              </svg>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <!-- Three Execution Approaches Breakdown -->
+      <section aria-labelledby="approaches-heading">
+        <div class="section-heading-block">
+          <h2 id="approaches-heading">How the Three MoE Execution Approaches Compare</h2>
+          <p>
+            Why standard loop dispatch and static batch padding bottleneck MoE training, and how <code class="inline-code">gmm</code> / <code class="inline-code">ragged_dot</code> eliminates both penalties.
+          </p>
+        </div>
+
+        <div class="strategy-stack">
+          <!-- Naive #1 -->
+          <article class="strategy-row">
+            <div class="strategy-copy">
+              <p class="panel-kicker">Naive Approach #1</p>
+              <h3>For-Loop Over Experts</h3>
+              <p>
+                Iterating <code class="inline-code">for e in range(num_experts)</code> launches dozens of tiny, separate matrix multiplications back-to-back. Dispatch overhead creates gaps between launches, while lightly loaded experts (like 35 tokens on a 128-row MXU tile) starve the systolic array and tank hardware utilization.
+              </p>
+              <span class="strategy-Verdict status-tag tag-bad">Hardware Starved · N Separate Kernel Launches</span>
+            </div>
+            <div class="mini-diagram-frame">
+              <svg class="mini-svg" viewBox="0 0 560 108" role="img" aria-label="Naive for-loop launching separate small kernels with stall gaps">
+                <text x="12" y="20" fill="#5e6573" font-family="JetBrains Mono, monospace" font-size="10">DISPATCH STREAM (MANY SMALL LAUNCHES + IDLE BUBBLES)</text>
+                <rect x="12" y="34" width="124" height="44" rx="4" fill="#1c69ce"/>
+                <text x="74" y="60" text-anchor="middle" fill="#ffffff" font-family="JetBrains Mono, monospace" font-size="10.5" font-weight="600">Launch #0 [510]</text>
+
+                <rect x="142" y="34" width="46" height="44" rx="4" fill="#f8d7d4" stroke="#c8372d" stroke-dasharray="3 3"/>
+                <text x="165" y="60" text-anchor="middle" fill="#a8261d" font-family="JetBrains Mono, monospace" font-size="9.5">Stall</text>
+
+                <rect x="194" y="34" width="84" height="44" rx="4" fill="#d67a10"/>
+                <text x="236" y="54" text-anchor="middle" fill="#ffffff" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600">#1 [35]</text>
+                <text x="236" y="69" text-anchor="middle" fill="#fff4e5" font-family="JetBrains Mono, monospace" font-size="8.5">73% tile idle</text>
+
+                <rect x="284" y="34" width="46" height="44" rx="4" fill="#f8d7d4" stroke="#c8372d" stroke-dasharray="3 3"/>
+                <text x="307" y="60" text-anchor="middle" fill="#a8261d" font-family="JetBrains Mono, monospace" font-size="9.5">Stall</text>
+
+                <rect x="336" y="34" width="120" height="44" rx="4" fill="#1b917c"/>
+                <text x="396" y="60" text-anchor="middle" fill="#ffffff" font-family="JetBrains Mono, monospace" font-size="10.5" font-weight="600">Launch #2 [290]</text>
+
+                <text x="468" y="59" fill="#5e6573" font-family="JetBrains Mono, monospace" font-size="10">&hellip; &times; E experts</text>
+              </svg>
+            </div>
+          </article>
+
+          <!-- Naive #2 -->
+          <article class="strategy-row">
+            <div class="strategy-copy">
+              <p class="panel-kicker">Naive Approach #2</p>
+              <h3>Padding All Experts to Max Size</h3>
+              <p>
+                Padding every expert buffer up to <code class="inline-code">max_tokens = 510</code> allows one batched matmul <code class="inline-code">[3, 510, K]</code>, but forces the TPU to read and multiply <strong>695 fake zero rows</strong> (475 on Expert 1 + 220 on Expert 2)—wasting <strong>45.4%</strong> of FLOPs and HBM memory bandwidth on padded zeros.
+              </p>
+              <span class="strategy-Verdict status-tag tag-warn">1 Launch · 45.4% Wasted FLOPs &amp; HBM Bandwidth</span>
+            </div>
+            <div class="mini-diagram-frame">
+              <svg class="mini-svg" viewBox="0 0 560 116" role="img" aria-label="Padded batched matmul wasting compute on zero-padded rows">
+                <defs>
+                  <pattern id="static-waste-hatch" width="8" height="8" patternTransform="rotate(45 0 0)" patternUnits="userSpaceOnUse">
+                    <rect width="8" height="8" fill="#fae2e0"/>
+                    <line x1="0" y1="0" x2="0" y2="8" stroke="#d14338" stroke-width="2"/>
+                  </pattern>
+                </defs>
+                <text x="12" y="18" fill="#5e6573" font-family="JetBrains Mono, monospace" font-size="10">UNIFORM PADDED TENSOR [3, 510, K] = 1,530 TOKEN SLOTS (695 ZEROS)</text>
+
+                <rect x="12" y="28" width="210" height="22" rx="3" fill="#1c69ce"/>
+                <text x="20" y="43" fill="#ffffff" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600">E0: 510 real</text>
+
+                <rect x="12" y="56" width="16" height="22" rx="2" fill="#d67a10"/>
+                <rect x="28" y="56" width="194" height="22" rx="2" fill="url(#static-waste-hatch)" stroke="#d14338" stroke-width="0.8"/>
+                <rect x="44" y="59" width="144" height="16" rx="2" fill="#fff8f7"/>
+                <text x="116" y="71" text-anchor="middle" fill="#991b1b" font-family="JetBrains Mono, monospace" font-size="9.5" font-weight="600">+475 padded zeros</text>
+
+                <rect x="12" y="84" width="120" height="22" rx="2" fill="#1b917c"/>
+                <text x="20" y="99" fill="#ffffff" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600">E2: 290 real</text>
+                <rect x="132" y="84" width="90" height="22" rx="2" fill="url(#static-waste-hatch)" stroke="#d14338" stroke-width="0.8"/>
+                <rect x="142" y="87" width="70" height="16" rx="2" fill="#fff8f7"/>
+                <text x="177" y="99" text-anchor="middle" fill="#991b1b" font-family="JetBrains Mono, monospace" font-size="9" font-weight="600">+220 zeros</text>
+
+                <text x="238" y="71" fill="#181c25" font-family="JetBrains Mono, monospace" font-size="14" font-weight="700">&rarr;</text>
+                <rect x="260" y="34" width="286" height="66" rx="4" fill="#fff8f6" stroke="#e4b4ae" stroke-width="1"/>
+                <text x="403" y="61" text-anchor="middle" fill="#181c25" font-family="JetBrains Mono, monospace" font-size="10.5" font-weight="700">Multiplies [3, 510, K] &times; [3, K, N]</text>
+                <text x="403" y="81" text-anchor="middle" fill="#a8261d" font-family="JetBrains Mono, monospace" font-size="9.5" font-weight="600">695 zero rows = 45.4% wasted FLOPs</text>
+              </svg>
+            </div>
+          </article>
+
+          <!-- Grouped Matmul Solution -->
+          <article class="strategy-row">
+            <div class="strategy-copy">
+              <p class="panel-kicker">The Pallas Kernel Solution</p>
+              <h3>Grouped Matmul (<code class="inline-code">gmm</code> / <code class="inline-code">ragged_dot</code>)</h3>
+              <p>
+                Packs all routed tokens contiguously into one flat tensor <code class="inline-code">[835, K]</code> alongside stacked expert weights <code class="inline-code">[Num_Experts, K, N]</code> and <code class="inline-code">group_sizes = [510, 35, 290]</code>. A single fused Pallas kernel streams VMEM tiles directly into the MXU across expert boundaries with <strong>zero wasted HBM padding</strong>.
+              </p>
+              <span class="strategy-Verdict status-tag tag-good">1 Fused Kernel · 0% Padding · Full MXU Saturation</span>
+            </div>
+            <div class="mini-diagram-frame">
+              <svg class="mini-svg" viewBox="0 0 560 116" role="img" aria-label="Grouped matmul contiguous packed tensor and group_sizes metadata">
+                <text x="12" y="18" fill="#5e6573" font-family="JetBrains Mono, monospace" font-size="10">CONTIGUOUS PACKED TOKENS [835, K] + GROUP_SIZES METADATA</text>
+
+                <rect x="12" y="30" width="152" height="36" rx="3" fill="#1c69ce"/>
+                <text x="88" y="52" text-anchor="middle" fill="#ffffff" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600">E0 [510]</text>
+
+                <rect x="166" y="30" width="34" height="36" rx="3" fill="#d67a10"/>
+                <text x="183" y="52" text-anchor="middle" fill="#ffffff" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600">35</text>
+
+                <rect x="202" y="30" width="90" height="36" rx="3" fill="#1b917c"/>
+                <text x="247" y="52" text-anchor="middle" fill="#ffffff" font-family="JetBrains Mono, monospace" font-size="10" font-weight="600">E2 [290]</text>
+
+                <rect x="12" y="76" width="280" height="26" rx="3" fill="#181c25"/>
+                <text x="152" y="93" text-anchor="middle" fill="#f8f6f0" font-family="JetBrains Mono, monospace" font-size="10">group_sizes = [510, 35, 290]</text>
+
+                <text x="308" y="54" fill="#181c25" font-family="JetBrains Mono, monospace" font-size="15" font-weight="700">&times;</text>
+
+                <rect x="326" y="30" width="96" height="72" rx="4" fill="#2c3342"/>
+                <text x="374" y="62" text-anchor="middle" fill="#ffffff" font-family="Plus Jakarta Sans, sans-serif" font-size="11" font-weight="700">Weights</text>
+                <text x="374" y="80" text-anchor="middle" fill="#d0d7de" font-family="JetBrains Mono, monospace" font-size="10">[E, K, N]</text>
+
+                <text x="435" y="69" fill="#181c25" font-family="JetBrains Mono, monospace" font-size="14" font-weight="700">&rarr;</text>
+
+                <rect x="454" y="30" width="94" height="72" rx="4" fill="#198558"/>
+                <text x="501" y="61" text-anchor="middle" fill="#ffffff" font-family="Plus Jakarta Sans, sans-serif" font-size="11" font-weight="700">1 Fused</text>
+                <text x="501" y="79" text-anchor="middle" fill="#dcfce7" font-family="JetBrains Mono, monospace" font-size="10">Pallas Op</text>
+              </svg>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <!-- Reference Summary Matrix -->
+      <section aria-labelledby="matrix-heading">
+        <div class="section-heading-block">
+          <h2 id="matrix-heading">Summary at a Glance</h2>
+          <p>Comparing memory layout, kernel dispatch count, and TPU hardware efficiency across architectures.</p>
+        </div>
+
+        <div class="table-wrapper">
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th scope="col">Execution Strategy</th>
+                <th scope="col">Input Tensor Shape</th>
+                <th scope="col">Weight Shape</th>
+                <th scope="col">Kernel Launches</th>
+                <th scope="col">Zero-Padding Waste</th>
+                <th scope="col">TPU MXU Outcome</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Dense FFN</strong> (Llama 3.2 1B)</td>
+                <td class="mono-cell">[Tokens, H]</td>
+                <td class="mono-cell">[H, Interm]</td>
+                <td class="mono-cell">1</td>
+                <td class="mono-cell">0%</td>
+                <td>Uniform compute; MXU fully saturated</td>
+              </tr>
+              <tr>
+                <td><strong>MoE Naive #1: For-Loop</strong></td>
+                <td class="mono-cell">E &times; [Tokens_e, K]</td>
+                <td class="mono-cell">E &times; [K, N]</td>
+                <td class="mono-cell">Num_Experts (E)</td>
+                <td class="mono-cell">0% (HBM)</td>
+                <td>Launch stalls + tiny ragged matmuls starve MXU</td>
+              </tr>
+              <tr>
+                <td><strong>MoE Naive #2: Padded Batch</strong></td>
+                <td class="mono-cell">[E, Max_Tokens, K]</td>
+                <td class="mono-cell">[E, K, N]</td>
+                <td class="mono-cell">1</td>
+                <td class="mono-cell">High (e.g., 45%+)</td>
+                <td>Burns FLOPs &amp; HBM bandwidth multiplying zeros</td>
+              </tr>
+              <tr>
+                <td><strong>MoE Grouped Matmul (gmm)</strong></td>
+                <td class="mono-cell">[Total_Tokens, K] + group_sizes</td>
+                <td class="mono-cell">[E, K, N]</td>
+                <td class="mono-cell">1 (Fused Pallas)</td>
+                <td class="mono-cell">0% (HBM)</td>
+                <td>Contiguous VMEM tiling; high MXU saturation</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer class="page-footer">
+      <span>TorchTPU &amp; Pallas Kernel Visual Explainer &mdash; Grouped Matrix Multiplication (<code class="inline-code">gmm</code> / <code class="inline-code">ragged_dot</code>)</span>
+      <span>Interactive SVG Hardware Simulation</span>
+    </footer>
+  </div>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
